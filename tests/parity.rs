@@ -10,6 +10,7 @@
 //!   byte-counted balloon does not;
 //! * `-W` below 2 is clamped instead of producing cowsay's nonsense output.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -64,14 +65,28 @@ fn run(program: &Path, args: &[&str], stdin: &[u8], cowpath: Option<&Path>) -> V
 }
 
 fn compare(args: &[&str], stdin: &[u8]) {
+    compare_programs(Path::new(OUR_BIN), Path::new("cowsay"), args, stdin);
+}
+
+/// Compare two programs byte for byte with the same environment.
+fn compare_programs(ours: &Path, theirs: &Path, args: &[&str], stdin: &[u8]) {
     let cowpath = cow_dir();
-    let want = run(Path::new("cowsay"), args, stdin, cowpath.as_deref());
-    let got = run(Path::new(OUR_BIN), args, stdin, cowpath.as_deref());
+    let want = run(theirs, args, stdin, cowpath.as_deref());
+    let got = run(ours, args, stdin, cowpath.as_deref());
     assert_eq!(
         String::from_utf8_lossy(&want),
         String::from_utf8_lossy(&got),
-        "difference for args {args:?} and stdin {stdin:?}"
+        "difference for {theirs:?} against {ours:?} with args {args:?} and stdin {stdin:?}"
     );
+}
+
+fn program_works(name: &str) -> bool {
+    Command::new(name)
+        .arg("probe")
+        .stdin(Stdio::null())
+        .output()
+        .map(|out| out.status.success() && !out.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 #[test]
@@ -181,4 +196,120 @@ fn listing_matches_cowsay() {
     }
     // Piped stdout makes `-l` print one name per line.
     compare(&["-l"], b"");
+}
+
+/// cowsay picks "say" or "think" from argv0, and so does cowtype, so the test
+/// runs our binary through a `cowthink` symlink.
+#[test]
+fn matches_cowthink_through_argv0() {
+    if !program_works("cowthink") {
+        eprintln!("cowthink not installed, skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cowtype-argv0-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("cannot create a temporary directory");
+    let link = dir.join("cowthink");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(OUR_BIN, &link).expect("cannot create the cowthink symlink");
+
+    for args in [
+        &["hi there"][..],
+        &["-e", "XX", "-T", "UU", "hi"][..],
+        &["-W", "12", "a thought that needs wrapping"][..],
+        &["-f", "tux", "hi"][..],
+    ] {
+        compare_programs(&link, Path::new("cowthink"), args, b"");
+    }
+
+    std::fs::remove_file(&link).ok();
+    std::fs::remove_dir(&dir).ok();
+}
+
+/// `-r` has to land on a real cow, so every picture it prints must be one the
+/// same build prints for an explicit `-f`.
+#[test]
+fn random_mode_speaks_with_an_installed_cow() {
+    if !cowsay_works() {
+        eprintln!("cowsay not installed, skipping");
+        return;
+    }
+    let Some(dir) = cow_dir() else {
+        eprintln!("no cow directory found, skipping");
+        return;
+    };
+    let mut spoken: HashSet<Vec<u8>> = HashSet::new();
+    for entry in std::fs::read_dir(&dir)
+        .expect("cannot read cow dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("cow") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        spoken.insert(run(
+            Path::new(OUR_BIN),
+            &["-f", &name, "hello there"],
+            b"",
+            Some(&dir),
+        ));
+    }
+    assert!(
+        !spoken.is_empty(),
+        "no cow files found in {}",
+        dir.display()
+    );
+
+    for _ in 0..6 {
+        let got = run(Path::new(OUR_BIN), &["-r", "hello there"], b"", Some(&dir));
+        assert!(
+            spoken.contains(&got),
+            "-r printed a picture that no cow file on {} produces: {}",
+            dir.display(),
+            String::from_utf8_lossy(&got)
+        );
+    }
+}
+
+/// Wide text is where the documented deviation lives: cowsay counts bytes, so
+/// its balloon is too wide for CJK; cowtype counts columns and stays square.
+#[test]
+fn wide_text_is_measured_in_columns() {
+    if !cowsay_works() {
+        eprintln!("cowsay not installed, skipping");
+        return;
+    }
+    let ours = run(Path::new(OUR_BIN), &["中文"], b"", cow_dir().as_deref());
+    let ours = String::from_utf8_lossy(&ours);
+    // Four columns plus one space of padding on each side.
+    assert!(
+        ours.contains(" ______"),
+        "the balloon should be six columns wide: {ours:?}"
+    );
+    assert!(
+        ours.contains("< 中文 >"),
+        "the text should be intact: {ours:?}"
+    );
+
+    // The same input through cowsay is wider, because it counts six bytes.
+    let theirs = run(Path::new("cowsay"), &["中文"], b"", cow_dir().as_deref());
+    assert_ne!(
+        theirs,
+        run(Path::new(OUR_BIN), &["中文"], b"", cow_dir().as_deref()),
+        "cowsay should disagree here; if it does not, the deviation note is stale"
+    );
+
+    // Wrapping counts columns too: four columns plus a space is five, so the
+    // two wide words land on separate balloon lines.
+    let wrapped = run(
+        Path::new(OUR_BIN),
+        &["-W", "5", "中文 中文"],
+        b"",
+        cow_dir().as_deref(),
+    );
+    let wrapped = String::from_utf8_lossy(&wrapped);
+    assert!(
+        wrapped.starts_with(" ______\n/ 中文 \\\n\\ 中文 /\n ------"),
+        "two wide words should take two balloon lines: {wrapped:?}"
+    );
 }
